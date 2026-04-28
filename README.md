@@ -69,7 +69,7 @@ See the [full forensic report](reports/AMD_gfx1201_UTCL2_TLB_FAULT/REPORT.md) fo
 | **OS** | Fedora 44 |
 | **Kernel** | 6.19.11-300.fc44.x86_64 |
 | **ROCm** | 7.2.1 |
-| **PyTorch** | 2.9.1+rocm (built from source) |
+| **PyTorch** | 2.11.0+rocm (built from source) |
 | **ONNX Runtime** | 1.22.2 (built from source with ROCm EP) |
 
 ## License
