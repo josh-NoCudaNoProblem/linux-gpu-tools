@@ -49,7 +49,7 @@ The rocBLAS GEMM kernel exercises a specific memory access pattern with real des
 | Component | Device | PCI Address | Driver |
 |-----------|--------|-------------|--------|
 | CPU | Intel Core Ultra 9 285K (Arrow Lake-S, 24C/24T) | — | — |
-| GPU 0 | Intel Arrow Lake-S iGPU | `00:02.0` | `i915` |
+| GPU 0 | Intel Arrow Lake-S iGPU | `00:02.0` | `xe` |
 | **GPU 1** | **AMD Radeon RX 9070 XT** (RDNA4 / gfx1201, 16 GB GDDR6) | **`04:00.0`** | **`amdgpu`** |
 | GPU 2 | Intel Arc B580 (Battlemage, 12 GB GDDR6) | `08:00.0` | `xe` |
 | RAM | 93.7 GiB DDR5 | — | — |
