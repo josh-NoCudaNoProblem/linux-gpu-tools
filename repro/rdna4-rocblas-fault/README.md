@@ -1,85 +1,135 @@
-# RDNA4 rocBLAS GEMM Fault — Reproduction Package
+# RDNA4 LightGlue Crash Reproducer
 
-Minimal reproducer for the gfx1201 (AMD Radeon RX 9070 XT) UTCL2 TLB coherency fault
-that occurs in the rocBLAS GEMM kernel during sustained FP16 matrix multiplication.
+Minimal, self-contained reproducer for the `GCVM_L2_PROTECTION_FAULT` / UTCL2
+TLB coherency fault on AMD RDNA4 (gfx1201) GPUs.
+
+**Full forensic report:** [reports/AMD_gfx1201_UTCL2_TLB_FAULT](../../reports/AMD_gfx1201_UTCL2_TLB_FAULT)
 
 ## The Bug
 
-A `GCVM_L2_PROTECTION_FAULT` with status `0x00801031` occurs inside `label_LoopBeginL` /
-`label_LoopEndL` — the inner loop of the rocBLAS GEMM kernel — when processing real
-normalized FP16 descriptor data. The fault has been reproduced **28 times** with a
-**100% reproduction rate** using real data and **0%** with synthetic random data.
+The rocBLAS GEMM kernel faults when processing sustained LightGlue
+(transformer-based feature matcher) inference on normalized FP16 descriptors.
+The fault originates from a TLB set-conflict created by the complex memory
+access pattern of 9 transformer attention layers running interleaved GEMMs
+(Q×K^T, softmax, A×V, feedforward) per pair.
 
-See the [full forensic report](../../reports/AMD_gfx1201_UTCL2_TLB_FAULT/REPORT.md)
-for the complete technical analysis.
+**Critical finding:** The fault does NOT reproduce with raw `torch.mm()` loops
+(17K+ it/s, zero faults) or raw HIP stress tests (10K+ it/s, zero faults).
+It requires the real transformer attention memory access pattern to trigger the
+TLB conflict. This has been cross-validated across two independent code paths:
 
-## Files
+- **PyTorch** LightGlue → rocBLAS → fault (~200 it/s)
+- **ONNX Runtime** LightGlue ONNX → rocBLAS → fault (~60 it/s)
 
-| File | Description |
-|------|-------------|
-| `rdna4_repro.py` | Minimal Python reproducer — loads LightGlue and runs inference in a tight loop |
-| `utcl2_stress.cpp` | HIP C++ stress test — exercises hipMalloc/hipFree and compute kernels |
-| `run_stress_test.sh` | Build and run wrapper for the C++ stress test |
-| `payload/` | Place your `.h5` feature files here (see below) |
+## Crash Severity
+
+Depends on GPU display configuration:
+
+| Configuration | Crash behavior |
+|---------------|----------------|
+| Displays on AMD GPU | SIGABRT + MODE1 reset, GPU usually recovers |
+| **Headless** (displays on iGPU) | **Hard system power-off** — GPU wedges, PCIe error propagates, motherboard cuts power |
+
+Both configurations reproduce the fault at **100% rate**.
+
+## What This Reproducer Does
+
+1. Loads pre-extracted, normalized FP16 feature descriptors (no images, no proprietary code)
+2. Loads the open-source LightGlue model (MIT licensed, ETH Zurich)
+3. Replicates the exact GPU-side operations from the production pipeline:
+   - Pre-allocate fixed GPU buffers (`torch.zeros` on device)
+   - Zero buffer (`tensor.zero_()`)
+   - Copy descriptor pair into buffer (`tensor.copy_()`)
+   - Run full LightGlue inference → 9 transformer layers → rocBLAS GEMMs
+4. Runs exhaustive pairs until the GPU faults (typically 1K–300K+ iterations)
 
 ## Requirements
 
-- AMD GPU with gfx1201 target (RX 9070 / 9070 XT)
-- ROCm 7.x installed
-- Python 3.10+ with PyTorch (ROCm build) or ONNX Runtime (ROCm EP)
-- LightGlue model weights
+- AMD RDNA4 GPU (gfx1201)
+- ROCm 7.2.x
+- Python 3.10+
 
-## Generating a Payload
-
-The crash requires real feature descriptor data — synthetic random FP16 data does **not**
-trigger the fault. To generate a payload:
-
-1. Extract features from any image dataset using [DISK](https://github.com/cvlab-epfl/disk):
-   ```python
-   import torch
-   from lightglue import DISK
-   extractor = DISK(max_num_keypoints=1024).eval().cuda()
-   # Run on your images, save the features
-   ```
-
-2. Save the descriptors to an HDF5 file and place it in the `payload/` directory.
-
-3. Run the reproducer:
-   ```bash
-   python rdna4_repro.py --features payload/your_features.h5
-   ```
-
-The fault typically occurs within **1,000 to 200,000 iterations** (1–30 minutes at ~60 it/s).
-
-## Running the HIP C++ Stress Test (Negative Control)
-
-This test is a **negative control** — it exercises raw HIP memory allocation, compute kernels,
-and memory thrashing as aggressively as possible. The GPU **passed** at **10,000+ iterations/sec**
-at full saturation without a single fault.
-
-This proves:
-- Raw HIP `hipMalloc`/`hipFree` cycles do not trigger the fault
-- Generic compute kernels do not trigger the fault
-- The GPU hardware is stable under sustained maximum load
-- **The fault is specific to the rocBLAS GEMM kernel's memory access pattern** on real
-  normalized FP16 descriptor data — not a general HIP or memory instability
+## Setup
 
 ```bash
-sudo ./run_stress_test.sh
-# Expected: 10,000+ it/s, zero faults, GPU at 100% utilization
+pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+pip install git+https://github.com/cvg/LightGlue.git
 ```
 
-## Monitoring During Reproduction
+### Descriptor Payload
 
-For best results, run these alongside the reproducer:
+The descriptor tensor (`data/descriptors.pt`, ~257 MB) is not included in
+this repository due to size. Download it from:
+
+> **[Download descriptors.pt](https://drive.google.com/file/d/PLACEHOLDER)** (257 MB)
+
+Place it at `data/descriptors.pt` relative to this directory.
+
+Alternatively, generate your own payload from any hloc `features.h5` file:
+```bash
+python extract_payload.py /path/to/features.h5
+```
+
+## Run
 
 ```bash
-# Terminal 1: GPU fault monitor
-../tools/gpu-fault-monitor/gpu_fault_monitor.sh
+python reproduce.py
 
-# Terminal 2: Crash signal monitor
-../tools/crash-monitor/crash_monitor.sh
-
-# Terminal 3: Run the reproducer
-python rdna4_repro.py --features payload/your_features.h5
+# With dmesg monitoring (requires sudo)
+python reproduce.py --monitor-dmesg
 ```
+
+Monitor GPU faults on the host in a separate terminal:
+```bash
+sudo dmesg --follow | grep -i 'amdgpu\|PROTECTION_FAULT'
+```
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `reproduce.py` | Main reproducer — LightGlue matching loop on real descriptors |
+| `extract_payload.py` | Extracts descriptor tensors from hloc features.h5 |
+| `data/` | Place `descriptors.pt` here (see download link above) |
+
+## Privacy
+
+The `descriptors.pt` payload contains **only normalized float16 descriptor
+vectors** — 128-dimensional floating point numbers between -1 and 1. No images,
+no filenames, no keypoint coordinates, no scores, no image dimensions. It is
+mathematically impossible to reconstruct the source images from these descriptors.
+Keypoint coordinates used in matching are randomly generated.
+
+## Expected Behavior
+
+On a gfx1201 GPU with ROCm 7.2.x, the reproducer will trigger a GPU fault
+visible in `dmesg`:
+
+```
+amdgpu: MES might be in unrecoverable state, issue a GPU reset
+amdgpu: GPU reset begin!. Source:  3
+amdgpu: MODE1 reset
+amdgpu: VRAM is lost due to GPU reset!
+```
+
+The Python process will receive SIGABRT. In headless configuration, the system
+may hard power-off instead.
+
+**Important:** This fault does NOT reproduce on ROCm < 7.2. Earlier ROCm
+versions (6.x) exhibited a different bug (RocPrim race condition). This
+reproducer specifically targets the rocBLAS GEMM TLB fault in the ROCm 7.x
+driver stack.
+
+## Environment (Tested)
+
+| Component | Version |
+|-----------|---------|
+| GPU | AMD Radeon RX 9070 XT (gfx1201, 16 GB GDDR6) |
+| ROCm | 7.2.1 |
+| PyTorch | 2.11.0+rocm |
+| LightGlue | git (MIT license, ETH Zurich) |
+| OS | Fedora 44, kernel 6.19.11-300.fc44.x86_64 |
+
+## License
+
+Apache 2.0
