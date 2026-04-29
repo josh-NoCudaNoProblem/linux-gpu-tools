@@ -220,6 +220,7 @@ But FFmpeg's VAAPI path silently falls back to software decode — the decoded f
 |--------|--------|------|---------|
 | CPU Only | — | 33.6s | baseline |
 | QSV | Intel Arc B580 (Xe2) | 21.5s | **1.56×** |
+| QSV | Intel iGPU (Arrow Lake) | 27.0s | **1.24×** |
 | VAAPI | AMD Radeon RX 9070 XT | ~33s | ~1.0× (decode fast, PCIe transfer bottleneck) |
 
 > **Note:** AMD VAAPI decode is fast (~91% VCN utilization), but auto-download over
