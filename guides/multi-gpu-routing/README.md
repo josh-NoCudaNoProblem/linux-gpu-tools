@@ -196,6 +196,7 @@ Cache the result — `setvars.sh` takes ~1 second.
 | OpenVINO EP ignoring `device_type` | Always runs on iGPU | Use native `openvino.Core().compile_model(model, "GPU.1")` |
 | Missing `source setvars.sh` | `ImportError: libsycl.so.8 not found` | Capture env before subprocess spawn |
 | `HIP_VISIBLE_DEVICES` not set | ROCm may see wrong GPU in multi-AMD systems | Always set to the 0-based AMD ordinal |
+| Overlaying PyTorch VRAM info replaces sysfs device list | All GPUs map to the same render node (e.g., B580 and 9070 XT both → renderD129) | Merge VRAM onto sysfs devices, never replace the sysfs list — `torch.cuda` ordinal 0 ≠ DRM card index 2 |
 
 ## System Tested On
 
