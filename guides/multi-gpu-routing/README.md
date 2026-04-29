@@ -164,28 +164,67 @@ def drm_to_openvino_device(drm_card_index: int) -> str:
 
 Same pattern as ROCm but filtered by Intel vendor.
 
-## oneAPI Environment Capture
+### DRM → FFmpeg Hardware Acceleration
 
-Intel XPU PyTorch requires the full oneAPI environment (`LD_LIBRARY_PATH`, `CMPLR_ROOT`, `MKLROOT`, etc.). Capturing it from a sourceable script:
+FFmpeg hardware video decode requires vendor-specific acceleration methods. **VAAPI works for AMD but fails on Intel Xe KMD. Use QSV for Intel.**
 
 ```python
-import subprocess
-
-def get_oneapi_env() -> dict:
-    """Source setvars.sh in a subshell and capture the resulting environment."""
-    result = subprocess.run(
-        ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force 2>/dev/null && env -0"],
-        capture_output=True, text=True, timeout=15,
-    )
-    env = {}
-    for entry in result.stdout.split("\0"):
-        if "=" in entry:
-            key, _, value = entry.partition("=")
-            env[key] = value
-    return env
+def get_ffmpeg_hw_args(render_device: str) -> tuple[list, str]:
+    """Build FFmpeg hwaccel args and filter prefix for a given render node.
+    
+    Returns (hw_args, vf_prefix) where vf_prefix should be prepended
+    to the -vf filter string.
+    """
+    import os
+    node_name = os.path.basename(render_device)
+    vendor_path = f"/sys/class/drm/{node_name}/device/vendor"
+    
+    is_intel = False
+    try:
+        if os.path.exists(vendor_path):
+            is_intel = open(vendor_path).read().strip() == "0x8086"
+    except Exception:
+        pass
+    
+    if is_intel:
+        # Intel: QSV (Quick Sync Video) via oneVPL/libmfx
+        # VAAPI fails silently on Xe KMD — QSV bypasses it entirely
+        hw_args = ["-hwaccel", "qsv", "-qsv_device", render_device,
+                   "-hwaccel_output_format", "qsv"]
+        vf_prefix = "hwdownload,format=nv12,"
+    else:
+        # AMD: plain VAAPI via Mesa radeonsi freeworld driver
+        # FFmpeg auto-downloads decoded frames to system memory
+        hw_args = ["-hwaccel", "vaapi", "-hwaccel_device", render_device]
+        vf_prefix = ""
+    
+    return hw_args, vf_prefix
 ```
 
-Cache the result — `setvars.sh` takes ~1 second.
+#### Why VAAPI Fails on Intel Xe KMD
+
+The Intel Media Driver (`iHD_drv_video.so`) loads and reports full decode profiles on Xe KMD:
+
+```
+vainfo: Driver version: Intel iHD driver for Intel(R) Gen Graphics - 25.4.6
+vainfo: Supported profile and entrypoints
+      VAProfileH264Main: VAEntrypointVLD
+      VAProfileHEVCMain: VAEntrypointVLD
+```
+
+But FFmpeg's VAAPI path silently falls back to software decode — the decoded frames never touch the GPU hardware. This is an Xe KMD + iHD integration gap. QSV uses a different code path (oneVPL → libmfx) that works correctly.
+
+#### Benchmark: 4K HEVC → 1080p PNG (same video, same system)
+
+| Method | Device | Time | Speedup |
+|--------|--------|------|---------|
+| CPU Only | — | 33.6s | baseline |
+| QSV | Intel Arc B580 (Xe2) | 21.5s | **1.56×** |
+| VAAPI | AMD Radeon RX 9070 XT | ~33s | ~1.0× (decode fast, PCIe transfer bottleneck) |
+
+> **Note:** AMD VAAPI decode is fast (~91% VCN utilization), but auto-download over
+> PCIe negates the gain when the filter chain (fps, scale, png compression) runs on CPU.
+> The B580's QSV hwdownload path is more efficient for this workload.
 
 ## Common Pitfalls
 
@@ -196,7 +235,9 @@ Cache the result — `setvars.sh` takes ~1 second.
 | OpenVINO EP ignoring `device_type` | Always runs on iGPU | Use native `openvino.Core().compile_model(model, "GPU.1")` |
 | Missing `source setvars.sh` | `ImportError: libsycl.so.8 not found` | Capture env before subprocess spawn |
 | `HIP_VISIBLE_DEVICES` not set | ROCm may see wrong GPU in multi-AMD systems | Always set to the 0-based AMD ordinal |
-| Overlaying PyTorch VRAM info replaces sysfs device list | All GPUs map to the same render node (e.g., B580 and 9070 XT both → renderD129) | Merge VRAM onto sysfs devices, never replace the sysfs list — `torch.cuda` ordinal 0 ≠ DRM card index 2 |
+| Overlaying PyTorch VRAM info replaces sysfs device list | All GPUs map to same render node | Merge VRAM onto sysfs devices — `torch.cuda` ordinal 0 ≠ DRM card index 2 |
+| Using VAAPI for Intel GPUs on Xe KMD | Silent CPU fallback, no actual HW decode | Use QSV (`-hwaccel qsv -qsv_device /dev/dri/renderDxxx`) instead |
+| Using `-hwaccel_output_format vaapi` on AMD | Filter chain error | Only use plain `-hwaccel vaapi` for AMD — let FFmpeg auto-download |
 
 ## System Tested On
 
@@ -214,3 +255,4 @@ Cache the result — `setvars.sh` takes ~1 second.
 ## License
 
 Apache 2.0 — See [LICENSE](../../LICENSE)
+
