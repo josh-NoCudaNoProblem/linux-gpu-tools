@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
             echo "  Bzy_MHz — Effective clock frequency under load"
             echo "  PkgWatt — Total package power draw"
             echo "  CorWatt — Per-core power draw"
-            echo "  PkgTmp  — Package temperature"
+            echo "  Temp    — CPU temperature (PkgTmp on Intel, k10temp on AMD)"
             echo ""
             echo "Options:"
             echo "  --interval, -i SECONDS   Update interval (default: 2)"
@@ -63,9 +63,41 @@ if ! command -v turbostat &>/dev/null; then
     exit 1
 fi
 
-echo "=== CPU Telemetry Started $(date) ==="
-echo "Interval: ${INTERVAL}s"
-echo "Press Ctrl+C to stop"
-echo ""
+# --- Detect temperature source ---
+# AMD CPUs (Zen/Strix) expose temperature via k10temp hwmon, not turbostat MSRs.
+# Intel CPUs expose temperature natively via turbostat's PkgTmp column.
+K10TEMP_INPUT=""
+for hwmon_name in /sys/class/hwmon/hwmon*/name; do
+    if [ -f "$hwmon_name" ] && grep -q "k10temp" "$hwmon_name" 2>/dev/null; then
+        K10TEMP_INPUT="$(dirname "$hwmon_name")/temp1_input"
+        break
+    fi
+done
 
-sudo turbostat --show CPU,Core,Busy%,Bzy_MHz,PkgWatt,CorWatt,PkgTmp -i "$INTERVAL"
+if [ -n "$K10TEMP_INPUT" ]; then
+    echo "=== CPU Telemetry Started $(date) ==="
+    echo "Interval: ${INTERVAL}s | Temp source: k10temp (AMD)"
+    echo "Press Ctrl+C to stop"
+    echo ""
+    trap 'echo ""; echo "Telemetry stopped."; exit 0' INT
+    while true; do
+        RAW=$(cat "$K10TEMP_INPUT")
+        TEMP_INT=$((RAW / 1000))
+        TEMP_DEC=$(( (RAW % 1000) / 100 ))
+        TEMP="${TEMP_INT}.${TEMP_DEC}"
+        sudo turbostat --quiet --show Core,CPU,Busy%,Bzy_MHz,CorWatt,PkgWatt -n 1 sleep "$INTERVAL" 2>&1 | \
+            awk -v temp="$TEMP" '
+            /^[0-9]+\.[0-9]+ sec/ { next }
+            /Core.*CPU.*Busy/ { printf "%s\tPkgTmp\n", $0; next }
+            /^-\t/ { printf "%s\t%s\n", $0, temp; next }
+            { print }'
+        echo ""
+    done
+else
+    echo "=== CPU Telemetry Started $(date) ==="
+    echo "Interval: ${INTERVAL}s | Temp source: PkgTmp (Intel)"
+    echo "Press Ctrl+C to stop"
+    echo ""
+    # Intel: turbostat natively exposes PkgTmp
+    sudo turbostat --show CPU,Core,Busy%,Bzy_MHz,PkgWatt,CorWatt,PkgTmp -i "$INTERVAL"
+fi
